@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Images, Sparkles, X } from "lucide-react";
 import { toast } from "sonner";
 import {
+  DEFAULT_GOAL,
   DEMO_GOAL,
   DEMO_PROFILES,
   DEMO_STEPS,
@@ -9,7 +10,6 @@ import {
   GOAL_PLACEHOLDER,
   SUCCESS_PLACEHOLDER,
   cancelJob,
-  getHealth,
   isDemoCheckout,
   isUsableSuccessSelector,
   readImagesAsDataUrls,
@@ -29,7 +29,7 @@ type Mode = "auto" | "screenshots";
 export default function RunAuditModal({ isOpen, onClose, url }: Props) {
   const demo = useMemo(() => isDemoCheckout(url), [url]);
   const [mode, setMode] = useState<Mode>("auto");
-  const [goal, setGoal] = useState(demo ? DEMO_GOAL : "");
+  const [goal, setGoal] = useState(demo ? DEMO_GOAL : DEFAULT_GOAL);
   const [success, setSuccess] = useState(demo ? DEMO_SUCCESS : "");
   const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
@@ -40,7 +40,7 @@ export default function RunAuditModal({ isOpen, onClose, url }: Props) {
   useEffect(() => {
     if (!isOpen) return;
     setMode("auto");
-    setGoal(demo ? DEMO_GOAL : "");
+    setGoal(demo ? DEMO_GOAL : DEFAULT_GOAL);
     setSuccess(demo ? DEMO_SUCCESS : "");
     setFiles([]);
     setError("");
@@ -49,14 +49,13 @@ export default function RunAuditModal({ isOpen, onClose, url }: Props) {
 
   if (!isOpen) return null;
 
-  // The selector is what makes task_completed true. Blank means it can never
-  // fire and every profile scores 0; "body" is visible before the task starts
-  // and every profile scores 1. Neither is a measurement.
   const selectorState = isUsableSuccessSelector(success);
+  const typedGoal = goal.trim() || (!selectorState.ok ? success.trim() : "");
+  const typedSelector = selectorState.ok ? success.trim() : "";
   const ready =
     mode === "screenshots"
       ? files.length > 0
-      : demo || (goal.trim().length > 0 && selectorState.ok);
+      : demo || typedGoal.length > 0;
 
   const startCapture = async () => {
     const body = demo
@@ -70,22 +69,25 @@ export default function RunAuditModal({ isOpen, onClose, url }: Props) {
         }
       : {
           url,
-          success_selector: success.trim(),
-          goal: goal.trim(),
+          success_selector: typedSelector,
+          goal: typedGoal || DEFAULT_GOAL,
           plan_once: true,
           profile_ids: DEMO_PROFILES,
           n_trials: 1,
           diagnose: true,
         };
-    try {
-      return await startJob(body);
-    } catch (first) {
-      const message = first instanceof Error ? first.message : "";
-      const stuck = message.match(/already running \(([^)]+)\)/);
-      if (!stuck) throw first;
-      await cancelJob(stuck[1]);
-      return await startJob(body);
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        return await startJob(body);
+      } catch (first) {
+        const message = first instanceof Error ? first.message : "";
+        const stuck = message.match(/already running \(([^)]+)\)/);
+        if (!stuck) throw first;
+        await cancelJob(stuck[1]);
+        await new Promise((resolve) => window.setTimeout(resolve, 200));
+      }
     }
+    throw new Error("capture is still shutting down; try again");
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -93,11 +95,6 @@ export default function RunAuditModal({ isOpen, onClose, url }: Props) {
     setBusy(true);
     setError("");
     try {
-      if (!(await getHealth())) {
-        setError("Lithium is not running. Start: uvicorn lithium.app:app --port 8000");
-        setBusy(false);
-        return;
-      }
       if (running && jobId) {
         await cancelAudit();
       }
@@ -220,9 +217,9 @@ export default function RunAuditModal({ isOpen, onClose, url }: Props) {
           ) : (
             <>
               <p className="ws-modal-hint">
-                Nitrogen navigates with a goal. Both fields are required: name
-                a task with an end state, and a selector that appears on the
-                page only once that task is done.
+                A goal is already filled in. Click Start capture. Change the
+                sentence only if you want a different task. CSS selector is
+                optional.
               </p>
               <div className="ws-modal-field">
                 <label className="ws-modal-label">Task goal</label>
@@ -234,7 +231,9 @@ export default function RunAuditModal({ isOpen, onClose, url }: Props) {
                 />
               </div>
               <div className="ws-modal-field">
-                <label className="ws-modal-label">Success selector</label>
+                <label className="ws-modal-label">
+                  Success selector (optional)
+                </label>
                 <input
                   className="ws-modal-input plain"
                   placeholder={SUCCESS_PLACEHOLDER}
@@ -242,11 +241,6 @@ export default function RunAuditModal({ isOpen, onClose, url }: Props) {
                   onChange={(e) => setSuccess(e.target.value)}
                 />
               </div>
-              {success.trim() && !selectorState.ok ? (
-                <p className="ws-modal-hint" style={{ color: "#E8A598" }}>
-                  {selectorState.reason}
-                </p>
-              ) : null}
             </>
           )}
 
@@ -259,7 +253,7 @@ export default function RunAuditModal({ isOpen, onClose, url }: Props) {
             <button
               type="submit"
               className="ws-toolbar-audit-btn"
-              disabled={busy || !ready}
+              disabled={busy || (mode === "screenshots" && !ready)}
             >
               {mode === "screenshots" ? (
                 <Images size={13} />

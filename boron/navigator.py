@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 from boron.capture import element_at_point, focusable_ax_text, viewport_screenshot_b64
 
@@ -34,9 +35,6 @@ COORDINATE_SCALE = 1000
 # is worth giving; a second identical claim means it is not going to re-examine
 # the page, and the run should end rather than spend the budget arguing.
 MAX_UNVERIFIED_DONE = 2
-# Observed live on Wikipedia: Qwen3-VL clicked the same dead heading 12 times
-# after being told it did nothing. Two identical misses is enough.
-MAX_IDENTICAL_DEAD = 2
 # An action that navigates leaves no page to screenshot or query until the next
 # document exists. Bounded, because a page that never settles must not hang the
 # step budget.
@@ -66,6 +64,13 @@ Rules:
 - Coordinates are on a 0-1000 grid, whatever the image size: x=0 is the left
   edge and x=1000 the right edge; y=0 is the top and y=1000 the bottom.
 - Aim at the centre of what you want to activate.
+- Click a link or button. Aim at the linked words themselves, not the
+  surrounding heading or paragraph.
+- Do not click headings, paragraphs, logos, or static text.
+- Never emit two JSON objects. If a click should finish the goal, click now
+  and emit done on the next turn.
+- If an earlier action produced no change, pick a different control and
+  different coordinates. Do not repeat it.
 - Emit "done" only once the goal is actually visible as achieved.
 - Emit "give_up" if the page offers no way to reach the goal."""
 
@@ -109,20 +114,31 @@ def build_prompt(
 
 
 def parse_action(raw: str) -> dict | None:
-    """Tolerant extraction. A malformed reply is a failed step, never a crash."""
+    """Tolerant extraction. A malformed reply is a failed step, never a crash.
+
+    Observed live: Qwen3-VL emitted a click object and a truncated done object
+    in one reply. Spanning from the first `{` to the last `}` is not JSON, so
+    the click that would have opened the article was discarded. Decode the
+    first complete object instead.
+    """
     text = (raw or "").strip()
     if "</think>" in text:
         text = text.split("</think>", 1)[-1].strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        payload = json.loads(text[start : end + 1])
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(payload, dict) or not isinstance(payload.get("action"), str):
-        return None
-    return payload
+    decoder = json.JSONDecoder()
+    idx = 0
+    while idx < len(text):
+        start = text.find("{", idx)
+        if start == -1:
+            return None
+        try:
+            payload, _end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            idx = start + 1
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("action"), str):
+            return payload
+        idx = start + 1
+    return None
 
 
 def navigate(
@@ -147,6 +163,8 @@ def navigate(
     errors = [] if errors is None else errors
     history: list[str] = []
     unverified_done = 0
+    dead: set[str] = set()
+    start_url = page.url
 
     for _ in range(max_steps):
         if is_visible(page, success_selector):
@@ -190,7 +208,10 @@ def navigate(
         entry = dict(action)
         verb = action.get("action")
         if verb == "done":
-            result.completed = is_visible(page, success_selector)
+            if success_selector:
+                result.completed = is_visible(page, success_selector)
+            else:
+                result.completed = True
             entry["verified"] = result.completed
             result.trace.append(entry)
             if result.completed:
@@ -217,14 +238,48 @@ def navigate(
             break
 
         try:
-            _apply(page, profile, action, width, height, press_point, entry, result, counters)
+            _apply(
+                page,
+                profile,
+                action,
+                width,
+                height,
+                press_point,
+                entry,
+                result,
+                counters,
+                dead,
+            )
         except Exception as exc:
             errors.append(f"{verb}: {exc}")
             entry["error"] = str(exc)
+            aimed = entry.get("aimed_selector")
+            if aimed:
+                dead.add(aimed)
+                if counters is not None and aimed not in counters.get("failed_selectors", []):
+                    counters["failed_selectors"].append(aimed)
+            dead_pt = _dead_point_key(action)
+            if dead_pt:
+                dead.add(dead_pt)
         result.trace.append(entry)
         unverified_done = 0
         history.append(_outcome(action, entry))
         _settle(page)
+        if (
+            not entry.get("error")
+            and not success_selector
+            and _path_changed(page, start_url)
+        ):
+            result.completed = True
+            if emit is not None:
+                emit(
+                    {
+                        "stage": "step",
+                        "selector": entry.get("aimed_selector") or verb,
+                        "action": verb,
+                    }
+                )
+            break
         if emit is not None:
             emit(
                 {
@@ -233,9 +288,6 @@ def navigate(
                     "action": verb,
                 }
             )
-        if entry.get("error") and _identical_dead_count(result.trace, entry) >= MAX_IDENTICAL_DEAD:
-            errors.append("repeated dead click; stopping")
-            break
 
     if not result.completed:
         result.completed = is_visible(page, success_selector)
@@ -256,38 +308,72 @@ def _settle(page) -> None:
     page.wait_for_timeout(50)
 
 
-def _identical_dead_count(trace: list[dict], entry: dict) -> int:
-    key = (entry.get("action"), entry.get("aimed_selector"), entry.get("x"), entry.get("y"))
-    return sum(
-        1
-        for row in trace
-        if row.get("error")
-        and (row.get("action"), row.get("aimed_selector"), row.get("x"), row.get("y")) == key
-    )
-
-
 def _outcome(action: dict, entry: dict) -> str:
     """What the model did and what the page did back.
 
-    Reporting only the attempt hides the single most useful signal there is. A
-    person knows immediately when a click achieves nothing; observed live, a
-    model told only what it had tried clicked the same dead control 21 times.
+    Do not echo a failed action as copyable JSON. Observed live: history that
+    contained `{"action":"click","x":[288,575],...}` made Qwen3-VL paste the
+    same coordinates for the remaining step budget.
     """
-    attempt = json.dumps(
-        {k: action[k] for k in ("action", "x", "y", "key", "target") if k in action}
-    )
     aimed = entry.get("aimed_selector")
-    where = f" on {aimed}" if aimed else ""
+    target = action.get("target") or aimed or "that"
     if entry.get("error"):
+        dead_pt = _dead_point_key(action)
+        coords = f" at {dead_pt.removeprefix('point:')}" if dead_pt else ""
         return (
-            f"{attempt} ->{where or ' this'} produced NO change. That element does "
-            f"nothing. Choose a different one."
+            f"clicking {target}{coords} produced NO change. Never click "
+            f"{aimed or 'that'} again, and never reuse those coordinates. "
+            "Look at the screenshot and click different linked words or a "
+            "button, not a heading or paragraph."
         )
-    return f"{attempt} ->{where} worked; the page changed."
+    verb = action.get("action")
+    where = f" on {aimed}" if aimed else ""
+    return f"{verb}{where} worked; the page changed."
 
 
-def _apply(page, profile, action, width, height, press_point, entry, result, counters) -> None:
+def _is_static(page, selector: str) -> bool:
+    """Headings and plain text cannot complete a goal; do not spend tremor retries.
+
+    Text *inside* a link or button is the control. Wikipedia's English box is
+    `a#js-link-box-en > strong`; refusing the inner tag throws away a real click.
+    """
+    try:
+        return bool(
+            page.evaluate(
+                """(sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    const clickable = (node) => {
+                        if (!node || !node.tagName) return false;
+                        const tag = node.tagName.toLowerCase();
+                        if (['a','button','input','select','textarea','summary'].includes(tag))
+                            return true;
+                        const role = (node.getAttribute('role') || '').toLowerCase();
+                        if (['button','link','menuitem','tab'].includes(role)) return true;
+                        if (node.hasAttribute('onclick') || node.hasAttribute('href'))
+                            return true;
+                        return false;
+                    };
+                    for (let n = el; n && n !== document.documentElement; n = n.parentElement) {
+                        if (clickable(n)) return false;
+                    }
+                    const tag = el.tagName.toLowerCase();
+                    return ['h1','h2','h3','h4','h5','h6','p','span','label','img',
+                            'li','ul','ol','header','footer','nav','strong','b','em']
+                            .includes(tag);
+                }""",
+                selector,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _apply(
+    page, profile, action, width, height, press_point, entry, result, counters, dead=None
+) -> None:
     verb = action["action"]
+    dead = dead if dead is not None else set()
 
     if verb == "click":
         if profile.keyboard_only:
@@ -295,7 +381,21 @@ def _apply(page, profile, action, width, height, press_point, entry, result, cou
         x, y = _to_css_px(action, page, width, height)
         aimed = element_at_point(page, x, y)
         entry["aimed_selector"] = aimed
+        dead_pt = _dead_point_key(action)
+        if dead_pt and dead_pt in dead:
+            raise RuntimeError(f"{dead_pt} is known dead; click a different point")
+        if aimed and aimed in dead:
+            raise RuntimeError(f"{aimed} is known dead; click a link or button")
+        if aimed and _is_static(page, aimed):
+            raise RuntimeError(f"{aimed} is text, not a control")
+        before_url = page.url
         press_point(page, profile, x, y, counters, aimed)
+        if aimed and _navigating_href(page, aimed):
+            if not _url_changed_since(page, before_url):
+                raise RuntimeError(
+                    f"{aimed} is a link but the page did not open; "
+                    "aim at the linked words"
+                )
         if aimed:
             result.activated_selectors.append(aimed)
         return
@@ -322,6 +422,71 @@ def _apply(page, profile, action, width, height, press_point, entry, result, cou
         return
 
     raise RuntimeError(f"unknown action {verb!r}")
+
+
+def _path_changed(page, start_url: str) -> bool:
+    """True when the document path is no longer the page we started on."""
+    try:
+        now = urlparse(page.url)
+        was = urlparse(start_url)
+    except Exception:
+        return False
+    return (now.path.rstrip("/") or "/") != (was.path.rstrip("/") or "/")
+
+
+def _navigating_href(page, selector: str) -> str | None:
+    """href that should leave the current document, or None."""
+    try:
+        href = page.evaluate(
+            """(sel) => {
+                let el = document.querySelector(sel);
+                while (el && el !== document.documentElement) {
+                    if (el.tagName && el.tagName.toLowerCase() === 'a'
+                        && el.hasAttribute('href'))
+                        return el.getAttribute('href');
+                    el = el.parentElement;
+                }
+                return null;
+            }""",
+            selector,
+        )
+    except Exception:
+        return "navigated"
+    if not href or not isinstance(href, str):
+        return None
+    href = href.strip()
+    if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+        return None
+    return href
+
+
+def _url_changed_since(page, before_url: str, timeout_ms: int = 3_000) -> bool:
+    try:
+        if page.url != before_url:
+            return True
+    except Exception:
+        return True
+    try:
+        page.wait_for_function(
+            "(u) => location.href !== u",
+            arg=before_url,
+            timeout=timeout_ms,
+        )
+        return True
+    except Exception:
+        try:
+            return page.url != before_url
+        except Exception:
+            return True
+
+
+def _dead_point_key(action) -> str | None:
+    """Grid coordinate pair, for banning a point that already did nothing."""
+    try:
+        x, y = _point(action)
+    except Exception:
+        return None
+    return f"point:{int(round(x))},{int(round(y))}"
 
 
 def _to_css_px(action, page, width, height) -> tuple[float, float]:

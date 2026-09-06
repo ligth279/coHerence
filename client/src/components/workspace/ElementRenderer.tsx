@@ -23,12 +23,15 @@ import { canonicalizeSiteUrl, previewUrl } from "@/lib/coherenceApi";
 import { useAuditStore } from "@/stores/auditStore";
 
 function sameSite(a: string, b: string): boolean {
-  const strip = (value: string) => value.replace(/\/+$/, "");
-  if (strip(a) === strip(b)) return true;
+  const origin =
+    typeof window !== "undefined" ? window.location.origin : "http://localhost";
   try {
-    return new URL(a, "https://local").hostname === new URL(b, "https://local").hostname;
+    const left = new URL(canonicalizeSiteUrl(a) || a, origin);
+    const right = new URL(canonicalizeSiteUrl(b) || b, origin);
+    const path = (value: string) => value.replace(/\/+$/, "") || "/";
+    return left.origin === right.origin && path(left.pathname) === path(right.pathname);
   } catch {
-    return false;
+    return a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
   }
 }
 

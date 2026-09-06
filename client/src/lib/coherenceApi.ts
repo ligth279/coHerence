@@ -38,7 +38,7 @@ export type HydrogenReport = {
 export type StartJobBody = {
   url: string;
   n_trials?: number;
-  success_selector: string;
+  success_selector?: string;
   steps?: string[];
   goal?: string;
   profile_ids?: string[];
@@ -161,7 +161,10 @@ export function isUsableSuccessSelector(raw: string): {
 
 export async function getHealth(): Promise<boolean> {
   try {
-    const response = await fetch("/api/health");
+    const response = await fetch("/api/health", {
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+    });
     if (!response.ok) return false;
     const payload = (await response.json()) as { ok?: boolean };
     return payload.ok === true;
@@ -194,11 +197,9 @@ export const DEMO_CHECKOUT_PATH = "/demo/checkout.html";
 export const DEMO_STEPS = ["#fake-button", "#submit-order"];
 export const DEMO_SUCCESS = "#order-confirmed";
 export const DEMO_GOAL = "Place the order";
-// Placeholders, never defaults. A goal that names no end state makes the model
-// click the middle of the page, and a selector that is not on the site can
-// never become visible, so `task_completed` would be false for every profile
-// however well navigation went. Both fields are the caller's to fill in.
-export const GOAL_PLACEHOLDER = "Add the blue mug to the basket and pay";
+export const DEFAULT_GOAL =
+  "Find the main action or article on this page and open it";
+export const GOAL_PLACEHOLDER = DEFAULT_GOAL;
 export const SUCCESS_PLACEHOLDER = "#order-confirmed";
 export const DEMO_PROFILES = [
   "baseline_default",

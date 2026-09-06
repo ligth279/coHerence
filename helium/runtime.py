@@ -42,11 +42,30 @@ def invoke_gpu(method: str, *args: Any) -> Any:
     return _ephemeral(method, *args)
 
 
+def _invoke_timeout() -> float:
+    from helium.constants import HELIUM_INVOKE_TIMEOUT_S
+
+    raw = os.environ.get("HELIUM_INVOKE_TIMEOUT", str(HELIUM_INVOKE_TIMEOUT_S))
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return float(HELIUM_INVOKE_TIMEOUT_S)
+
+
+def _call(handle, *args: Any) -> Any:
+    """Wait at most HELIUM_INVOKE_TIMEOUT_S so a rebooting replica cannot freeze Audit."""
+    timeout = _invoke_timeout()
+    spawn = getattr(handle, "spawn", None)
+    if spawn is None:
+        return handle.remote(*args)
+    return spawn(*args).get(timeout=timeout)
+
+
 def _deployed(method: str, *args: Any) -> Any:
     import modal
 
     cls = modal.Cls.from_name(MODAL_APP_NAME, HELIUM_CLS_NAME)
-    return getattr(cls(), method).remote(*args)
+    return _call(getattr(cls(), method), *args)
 
 
 def _live_gpu_cls() -> Any | None:
@@ -71,17 +90,17 @@ def _ephemeral(method: str, *args: Any) -> Any:
     """Cold-start path. Reuses the running app during `modal run`."""
     gpu = _live_gpu_cls()
     if gpu is not None:
-        return getattr(gpu(), method).remote(*args)
+        return _call(getattr(gpu(), method), *args)
 
     import modal
 
     from helium.modal_app import HeliumGPU, app
 
-    def _call() -> Any:
-        return getattr(HeliumGPU(), method).remote(*args)
+    def _run() -> Any:
+        return _call(getattr(HeliumGPU(), method), *args)
 
     if app.app_id:
-        return _call()
+        return _run()
     with modal.enable_output():
         with app.run():
-            return _call()
+            return _run()

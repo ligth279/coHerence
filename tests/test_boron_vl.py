@@ -66,6 +66,53 @@ def _run(tmp_path, profile_id, actions, latency_s=0.0, session_id=None, max_step
     return record, client
 
 
+def test_goal_only_completes_when_a_click_opens_a_new_path(tmp_path):
+    """DEFAULT_GOAL is 'open it'. A link that changes the document path has."""
+    dest = tmp_path / "article.html"
+    dest.write_text(
+        "<!doctype html><html><body><h1>Article</h1></body></html>",
+        encoding="utf-8",
+    )
+    src = tmp_path / "home.html"
+    src.write_text(
+        """<!doctype html><html><body style="margin:0">
+<a id="go" href="article.html" style="display:block;padding:40px 80px">Open article</a>
+</body></html>""",
+        encoding="utf-8",
+    )
+    client = ScriptedVLClient(
+        [{"action": "click", "x": 90, "y": 70, "target": "Open article"}]
+    )
+    record = run_session(
+        url=src.resolve().as_uri(),
+        profile_id="baseline_default",
+        session_id="open_path",
+        success_selector="",
+        goal=GOAL,
+        vl_client=client,
+        max_steps=3,
+        out_root=str(tmp_path),
+    )
+    assert record.telemetry.task_completed is True
+    assert len(client.calls) == 1
+
+
+def test_goal_without_selector_accepts_model_done(tmp_path):
+    client = ScriptedVLClient([{"action": "done", "reason": "the page is readable"}])
+    record = run_session(
+        url=FIXTURE_URL,
+        profile_id="baseline_default",
+        session_id="goal_only",
+        success_selector="",
+        goal=GOAL,
+        vl_client=client,
+        max_steps=3,
+        out_root=str(tmp_path),
+    )
+    assert record.telemetry.task_completed is True
+    assert len(client.calls) == 1
+
+
 # --- mode selection -------------------------------------------------------
 
 
@@ -437,19 +484,66 @@ def test_plan_once_refuses_to_replay_an_unproven_path(tmp_path):
     assert [r.profile_id for r in caught.value.records] == ["baseline_default"]
 
 
-def test_repeated_dead_click_stops_the_loop(tmp_path):
+def test_dead_heading_does_not_end_the_run(tmp_path):
     record, client = _run(
         tmp_path,
         "baseline_default",
-        [DEAD_SPOT, DEAD_SPOT, DEAD_SPOT, FAKE_BUTTON, SUBMIT],
+        [DEAD_SPOT, DEAD_SPOT, FAKE_BUTTON, SUBMIT],
         max_steps=12,
     )
-    assert record.telemetry.task_completed is False
-    assert len(client.calls) == 2
+    assert record.telemetry.task_completed is True
+    assert len(client.calls) == 4
     trace = json.loads(
         (Path(tmp_path) / "vl_baseline_default" / "nav_trace.json").read_text()
     )
-    assert trace["steps_taken"] == 2
+    assert any("fake-button" in (step.get("aimed_selector") or "") for step in trace["trace"])
+
+
+def test_failed_click_is_not_echoed_as_copyable_json(tmp_path):
+    """Observed live: history that contained the failed action JSON made the
+    model paste x=[288,575] for the rest of the budget."""
+    _, client = _run(
+        tmp_path, "baseline_default", [DEAD_SPOT, FAKE_BUTTON, SUBMIT]
+    )
+    follow_up = client.calls[1]["user"]
+    assert '"x": 500' not in follow_up
+    assert "NO change" in follow_up
+
+
+def test_clicking_text_inside_a_link_activates_the_link(tmp_path):
+    """Wikipedia's language box is `a > strong`. Refusing the inner tag as
+    static text throws away the click that leaves the portal."""
+    html = tmp_path / "inner_link.html"
+    html.write_text(
+        """<!doctype html><html><body style="margin:0">
+<a id="go" href="#opened" style="display:block;padding:40px 80px">
+  <strong id="label">Open article</strong>
+</a>
+<p id="opened" style="display:none">yes</p>
+<script>
+  document.getElementById('go').addEventListener('click', (e) => {
+    e.preventDefault();
+    document.getElementById('opened').style.display = 'block';
+  });
+</script>
+</body></html>""",
+        encoding="utf-8",
+    )
+    # 1280x800 viewport. The <strong> sits near (80+?, 40+?). A point inside
+    # the padded <a> hits the <strong>, not the <a> itself.
+    inner = {"action": "click", "x": 90, "y": 70, "target": "Open article"}
+    client = ScriptedVLClient([inner])
+    record = run_session(
+        url=html.resolve().as_uri(),
+        profile_id="baseline_default",
+        session_id="inner_link",
+        success_selector="#opened",
+        goal=GOAL,
+        vl_client=client,
+        max_steps=3,
+        out_root=str(tmp_path),
+    )
+    assert record.telemetry.task_completed is True
 
 
 def test_plan_once_needs_a_goal(tmp_path):
@@ -546,10 +640,26 @@ def test_a_packed_coordinate_pair_still_clicks(tmp_path):
         ('```json\n{"action": "click", "x": 1, "y": 2}\n```', "click"),
         ('Sure, I will click. {"action": "click", "x": 1, "y": 2}', "click"),
         ('<think>hmm</think>{"action": "press", "key": "Tab"}', "press"),
+        (
+            '{"action": "click", "x": [241, 360], "target": "featured article"}\n'
+            '{"action": "done", "reason": "The main article about President',
+            "click",
+        ),
     ],
 )
 def test_parse_action_accepts_the_shapes_a_model_actually_emits(raw, expected):
     assert parse_action(raw)["action"] == expected
+
+
+def test_parse_action_keeps_the_click_when_done_is_concatenated():
+    """Live Wikipedia: two objects in one reply. The first was the article link."""
+    parsed = parse_action(
+        '{"action": "click", "x": [241, 360], "target": "the featured article"}\n'
+        '{"action": "done", "reason": "The main article about President William McKinley has '
+    )
+    assert parsed is not None
+    assert parsed["action"] == "click"
+    assert parsed["x"] == [241, 360]
 
 
 @pytest.mark.parametrize("raw", ["", "no json", "{broken", '{"reason": "no action"}', "[1,2]"])

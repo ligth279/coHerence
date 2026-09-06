@@ -284,14 +284,7 @@ def _mutations(page):
 
 
 def _changed(page, before, before_url) -> bool:
-    """Did the press do anything? A navigation is the loudest possible yes.
-
-    `window.__boron.mutations` lives in the document, so a press that leaves the
-    page destroys the context it is read from and starts the next one at zero.
-    Reading that as "no change" calls the one press that worked a dead click,
-    and the navigator then tells the model that element does nothing -- which
-    ends the run on any site made of more than one page.
-    """
+    """True if the press mutated the DOM or navigated. Navigation drops the counter."""
     try:
         if page.url != before_url:
             return True
@@ -417,6 +410,8 @@ def _tab_to(page, selector, limit: int = 60) -> int:
 
 
 def _is_visible(page, selector: str) -> bool:
+    if not selector:
+        return False
     return page.locator(selector).is_visible()
 
 
@@ -516,14 +511,7 @@ class PlanFailed(RuntimeError):
 
 
 def _plan_from(out_dir: Path, record: RawSessionArtifacts) -> list[str]:
-    """The path the planning profile actually walked.
-
-    Refuses to hand back an unproven path. Replaying one would give every
-    constrained profile the same empty run, and a suite where nobody completes
-    reads downstream as "this site fails everyone" when the truth is only that
-    the model could not drive it. Silence here would be a false negative wearing
-    a score.
-    """
+    """Selectors the planner walked. Raises PlanFailed if the path is empty or unproven."""
     trace = json.loads((out_dir / NAV_TRACE_FILENAME).read_text(encoding="utf-8"))
     seen: list[str] = []
     for selector in trace.get("activated_selectors", []):

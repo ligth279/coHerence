@@ -21,13 +21,14 @@ from lithium.jobs import (
     append_event,
     cancel as cancel_job,
     get as get_job,
+    mark_worker_done,
     put as put_job,
     running_id,
     snapshot,
     snapshot_job,
     update,
 )
-from lithium.reports import create_report
+from lithium.reports import create_report, fill_from_score
 from lithium.safety import check_job_url, job_id_ok
 
 log = logging.getLogger("lithium")
@@ -66,7 +67,7 @@ class CreateJobBody(BaseModel):
 
     url: str
     n_trials: int = 1
-    success_selector: str
+    success_selector: str = ""
     steps: list[str] | None = None
     goal: str | None = None
     profile_ids: list[str] | None = None
@@ -139,16 +140,21 @@ def post_report(
     return report.model_dump(mode="json")
 
 
-def _execute_job(job_id: str, body: CreateJobBody, llm_client) -> None:
-    update(job_id, status=JobStatus.running, stage="capture")
+def _cancelled(job_id: str) -> bool:
+    live = get_job(job_id)
+    return live is not None and live.error == "cancelled"
 
+
+def _execute_job(job_id: str, body: CreateJobBody, llm_client) -> None:
     def on_progress(event: dict) -> None:
-        live = get_job(job_id)
-        if live is not None and live.error == "cancelled":
+        if _cancelled(job_id):
             raise RuntimeError("cancelled")
         append_event(job_id, event)
 
     try:
+        if _cancelled(job_id):
+            return
+        update(job_id, status=JobStatus.running, stage="capture")
         vl_client = None
         text_client = None
         vision_client = None
@@ -156,18 +162,18 @@ def _execute_job(job_id: str, body: CreateJobBody, llm_client) -> None:
             from nitrogen import ModalVLClient
 
             vl_client = ModalVLClient()
-        try:
-            from oxygen.client import GpuTextClient
+            try:
+                from oxygen.client import GpuTextClient
 
-            text_client = GpuTextClient()
-        except Exception:
-            text_client = None
-        try:
-            from fluorine import ModalVLClient as FluorineVLClient
+                text_client = GpuTextClient()
+            except Exception:
+                text_client = None
+            try:
+                from fluorine import ModalVLClient as FluorineVLClient
 
-            vision_client = FluorineVLClient()
-        except Exception:
-            vision_client = None
+                vision_client = FluorineVLClient()
+            except Exception:
+                vision_client = None
         report = run_pipeline(
             job_id,
             url=body.url,
@@ -185,8 +191,7 @@ def _execute_job(job_id: str, body: CreateJobBody, llm_client) -> None:
             text_client=text_client,
             vision_client=vision_client,
         )
-        live = get_job(job_id)
-        if live is not None and live.error == "cancelled":
+        if _cancelled(job_id):
             return
         if body.diagnose:
             update(job_id, stage="diagnose")
@@ -197,9 +202,8 @@ def _execute_job(job_id: str, body: CreateJobBody, llm_client) -> None:
                     report, client=llm_client if llm_client else None
                 )
             except Exception:
-                update(job_id, warning="diagnosis unavailable")
-        live = get_job(job_id)
-        if live is not None and live.error == "cancelled":
+                report = fill_from_score(report)
+        if _cancelled(job_id):
             return
         update(
             job_id,
@@ -209,12 +213,13 @@ def _execute_job(job_id: str, body: CreateJobBody, llm_client) -> None:
             error=None,
         )
     except Exception as exc:
-        live = get_job(job_id)
-        if live is not None and live.error == "cancelled":
+        if _cancelled(job_id):
             return
         log.exception("job %s failed", job_id)
         detail = next((line.strip() for line in str(exc).splitlines() if line.strip()), "job failed")
         update(job_id, status=JobStatus.error, stage="error", error=detail[:500])
+    finally:
+        mark_worker_done(job_id)
 
 
 def _capture_url(url: str, api_base: str) -> str:
@@ -237,34 +242,22 @@ def post_job(
         raise HTTPException(
             status_code=400, detail="pass steps or goal, not both or neither"
         )
-    # A selector that is not on the page under test can never become visible, so
-    # `task_completed` would be False for every profile however well navigation
-    # went, and hydrogen would score a total failure it never measured. Refuse
-    # the run instead of producing that number.
-    selector = body.success_selector.strip()
-    if not selector:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "success_selector is required: a CSS selector that becomes "
-                "visible on the target page only once the task is done"
-            ),
-        )
-    # The mirror of the same problem: these are visible before the task starts,
-    # so every profile would be marked complete at step 0.
+    selector = (body.success_selector or "").strip()
     if selector.lower() in {"body", "html", ":root", "*"}:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"success_selector {selector!r} is visible before the task "
-                "starts; every profile would be scored as complete"
-            ),
+            detail=f"success_selector {selector!r} is visible before the task starts",
+        )
+    if body.steps and not selector:
+        raise HTTPException(
+            status_code=400,
+            detail="success_selector is required when using steps",
         )
     try:
         url = check_job_url(body.url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
-    body = body.model_copy(update={"url": url})
+    body = body.model_copy(update={"url": url, "success_selector": selector})
     job_id = body.job_id or _new_id("job")
     if not job_id_ok(job_id):
         raise HTTPException(status_code=400, detail="job_id not allowed")
@@ -275,7 +268,14 @@ def post_job(
             detail=f"capture already running ({busy}); cancel it first",
         )
     try:
-        job = put_job(Job(job_id=job_id, n_trials=body.n_trials, url=body.url))
+        job = put_job(
+            Job(
+                job_id=job_id,
+                n_trials=body.n_trials,
+                url=body.url,
+                worker_alive=True,
+            )
+        )
     except KeyError:
         raise HTTPException(status_code=409, detail="job_id already exists") from None
     capture = body.model_copy(
@@ -339,15 +339,15 @@ def _execute_screenshot_job(
 ) -> None:
     import tempfile
 
-    update(job_id, status=JobStatus.running, stage="describe")
-
     def on_progress(event: dict) -> None:
-        live = get_job(job_id)
-        if live is not None and live.error == "cancelled":
+        if _cancelled(job_id):
             raise RuntimeError("cancelled")
         append_event(job_id, event)
 
     try:
+        if _cancelled(job_id):
+            return
+        update(job_id, status=JobStatus.running, stage="describe")
         if vision_client is None:
             try:
                 from fluorine import ModalVLClient as FluorineVLClient
@@ -372,8 +372,7 @@ def _execute_screenshot_job(
                 diagnose=False,
                 on_progress=on_progress,
             )
-        live = get_job(job_id)
-        if live is not None and live.error == "cancelled":
+        if _cancelled(job_id):
             return
         if diagnose:
             update(job_id, stage="diagnose")
@@ -384,7 +383,9 @@ def _execute_screenshot_job(
                     report, client=llm_client if llm_client else None
                 )
             except Exception:
-                update(job_id, warning="diagnosis unavailable")
+                report = fill_from_score(report)
+        if _cancelled(job_id):
+            return
         update(
             job_id,
             status=JobStatus.done,
@@ -393,8 +394,7 @@ def _execute_screenshot_job(
             error=None,
         )
     except Exception as exc:
-        live = get_job(job_id)
-        if live is not None and live.error == "cancelled":
+        if _cancelled(job_id):
             return
         log.exception("screenshot job %s failed", job_id)
         detail = next(
@@ -402,6 +402,8 @@ def _execute_screenshot_job(
             "job failed",
         )
         update(job_id, status=JobStatus.error, stage="error", error=detail[:500])
+    finally:
+        mark_worker_done(job_id)
 
 
 @app.post("/jobs/screenshots", status_code=202)
@@ -432,7 +434,7 @@ def post_screenshot_job(
             detail=f"capture already running ({busy}); cancel it first",
         )
     try:
-        job = put_job(Job(job_id=job_id, n_trials=1, url=url))
+        job = put_job(Job(job_id=job_id, n_trials=1, url=url, worker_alive=True))
     except KeyError:
         raise HTTPException(status_code=409, detail="job_id already exists") from None
     background.add_task(

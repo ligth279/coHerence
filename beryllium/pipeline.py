@@ -158,8 +158,9 @@ def _capture(
     seed: int | None,
     on_progress=None,
 ):
-    if not success_selector:
-        raise ValueError("success_selector is required when capturing")
+    if not success_selector and not goal:
+        raise ValueError("success_selector is required when capturing without a goal")
+    success_selector = success_selector or ""
     kwargs = {
         "url": url,
         "profile_ids": profile_ids,

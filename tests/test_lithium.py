@@ -150,6 +150,98 @@ def test_cancel_marks_running_job(client, monkeypatch):
     assert nxt.status_code == 202
 
 
+def test_cancelled_worker_keeps_the_slot(client, monkeypatch):
+    from helium.example import example_report
+    from lithium.jobs import Job, JobStatus, mark_worker_done, put as put_job, running_id
+
+    monkeypatch.setattr("lithium.app.run_pipeline", lambda *_a, **_k: example_report())
+    put_job(
+        Job(
+            job_id="job_live",
+            url="https://example.com",
+            status=JobStatus.error,
+            error="cancelled",
+            worker_alive=True,
+        )
+    )
+    assert running_id() == "job_live"
+    blocked = client.post(
+        "/jobs",
+        json={
+            "job_id": "job_blocked2",
+            "url": "https://example.com/checkout",
+            "success_selector": "#done",
+            "steps": ["#a"],
+            "diagnose": False,
+        },
+    )
+    assert blocked.status_code == 409
+    mark_worker_done("job_live")
+    nxt = client.post(
+        "/jobs",
+        json={
+            "job_id": "job_after_live",
+            "url": "https://example.com/checkout",
+            "success_selector": "#done",
+            "steps": ["#a"],
+            "diagnose": False,
+        },
+    )
+    assert nxt.status_code == 202
+
+
+def test_execute_does_not_resurrect_a_cancelled_job(monkeypatch):
+    from helium.example import example_report
+    from lithium.app import CreateJobBody, _execute_job
+    from lithium.jobs import Job, JobStatus, get as get_job, put as put_job
+
+    monkeypatch.setattr("lithium.app.run_pipeline", lambda *_a, **_k: example_report())
+    put_job(Job(job_id="job_q", url="https://example.com", worker_alive=True))
+    from lithium.jobs import cancel as cancel_job
+
+    cancel_job("job_q")
+    _execute_job(
+        "job_q",
+        CreateJobBody(
+            url="https://example.com",
+            success_selector="#done",
+            steps=["#a"],
+            diagnose=False,
+        ),
+        None,
+    )
+    live = get_job("job_q")
+    assert live is not None
+    assert live.error == "cancelled"
+    assert live.status is JobStatus.error
+    assert live.report is None
+    assert live.worker_alive is False
+
+
+def test_screenshot_diagnose_does_not_clear_cancel(monkeypatch):
+    from helium.example import example_report
+    from lithium.app import _execute_screenshot_job
+    from lithium.jobs import Job, JobStatus, cancel as cancel_job, get as get_job, put as put_job
+
+    monkeypatch.setattr(
+        "beryllium.pipeline.run_screenshot_pipeline",
+        lambda *_a, **_k: example_report(),
+    )
+
+    def fake_diag(report, client=None):
+        cancel_job("man_x")
+        return report
+
+    monkeypatch.setattr("helium.engine.diagnose", fake_diag)
+    put_job(Job(job_id="man_x", url="https://example.com", worker_alive=True))
+    _execute_screenshot_job("man_x", "https://example.com", [_png_bytes()], True, None)
+    live = get_job("man_x")
+    assert live is not None
+    assert live.error == "cancelled"
+    assert live.status is JobStatus.error
+    assert live.worker_alive is False
+
+
 def test_jobs_run_pipeline_in_background(client, monkeypatch):
     from helium.example import example_report
 
@@ -336,6 +428,18 @@ def test_job_failure_surfaces_exception(client, monkeypatch):
     assert "ERR_NAME_NOT_RESOLVED" in done["error"]
 
 
+def test_fill_from_score_writes_hydrogen_math():
+    from helium.example import example_report
+    from lithium.reports import fill_from_score
+
+    filled = fill_from_score(example_report())
+    assert filled.analyst == "hydrogen"
+    assert filled.overall_fairness_score == 72
+    assert "Fairness score 72/100" in filled.diagnosis
+    assert "Bottleneck" in filled.diagnosis
+    assert filled.remediation
+
+
 def test_diagnose_failure_keeps_score(client, monkeypatch):
     from helium.example import example_report
 
@@ -361,15 +465,46 @@ def test_diagnose_failure_keeps_score(client, monkeypatch):
     done = client.get("/jobs/job_diag").json()
     assert done["status"] == "done"
     assert done["report"]["overall_fairness_score"] == 72
-    assert done["warning"] == "diagnosis unavailable"
+    assert done["warning"] is None
+    assert "Fairness score" in done["report"]["diagnosis"]
+    assert done["report"]["analyst"] == "hydrogen"
+
+
+def test_diagnose_timeout_keeps_score(client, monkeypatch):
+    from helium.example import example_report
+
+    monkeypatch.setattr(
+        "lithium.app.run_pipeline", lambda *a, **k: example_report()
+    )
+
+    def boom(*_a, **_k):
+        raise TimeoutError("FunctionCall timed out")
+
+    monkeypatch.setattr("helium.engine.diagnose", boom)
+    response = client.post(
+        "/jobs",
+        json={
+            "job_id": "job_diag_to",
+            "url": "https://example.com/checkout",
+            "success_selector": "#done",
+            "steps": ["#a"],
+            "diagnose": True,
+        },
+    )
+    assert response.status_code == 202
+    done = client.get("/jobs/job_diag_to").json()
+    assert done["status"] == "done"
+    assert done["report"]["overall_fairness_score"] == 72
+    assert done["warning"] is None
+    assert "Fairness score" in done["report"]["diagnosis"]
+    assert done["report"]["analyst"] == "hydrogen"
 
 
 # --- the success selector is what makes task_completed a measurement --------
 
 
-@pytest.mark.parametrize("selector", ["", "   ", "body", "HTML", ":root", "*"])
+@pytest.mark.parametrize("selector", ["body", "HTML", ":root", "*"])
 def test_a_selector_that_cannot_measure_completion_is_refused(client, selector):
-    """Blank can never fire; `body` fires before the task starts. Neither is data."""
     response = client.post(
         "/jobs",
         json={
@@ -380,6 +515,30 @@ def test_a_selector_that_cannot_measure_completion_is_refused(client, selector):
     )
     assert response.status_code == 400
     assert "success_selector" in response.json()["detail"]
+
+
+def test_goal_without_selector_is_accepted(client, monkeypatch):
+    from helium.example import example_report
+
+    seen = {}
+
+    def fake_pipeline(job_id, **kwargs):
+        seen.update(kwargs)
+        return example_report()
+
+    monkeypatch.setattr("lithium.app.run_pipeline", fake_pipeline)
+    response = client.post(
+        "/jobs",
+        json={
+            "job_id": "job_goal_only",
+            "url": "https://en.wikipedia.org",
+            "goal": "Open the English article from the main page",
+            "diagnose": False,
+        },
+    )
+    assert response.status_code == 202
+    assert seen["goal"] == "Open the English article from the main page"
+    assert seen["success_selector"] == ""
 
 
 # --- manual capture: screenshots a human took ------------------------------

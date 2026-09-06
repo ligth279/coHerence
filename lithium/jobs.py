@@ -29,6 +29,8 @@ class Job:
     current_profile: str = ""
     preview: str | None = None
     events: list[dict] = field(default_factory=list)
+    # Stays true until the background worker returns, including after cancel.
+    worker_alive: bool = False
 
 
 _lock = threading.Lock()
@@ -38,7 +40,7 @@ _JOBS: dict[str, Job] = {}
 def running_id() -> str | None:
     with _lock:
         for job in _JOBS.values():
-            if job.status in (JobStatus.queued, JobStatus.running):
+            if job.worker_alive or job.status in (JobStatus.queued, JobStatus.running):
                 return job.job_id
         return None
 
@@ -59,6 +61,8 @@ def get(job_id: str) -> Job | None:
 def update(job_id: str, **fields) -> Job:
     with _lock:
         job = _JOBS[job_id]
+        if job.error == "cancelled":
+            fields = {key: value for key, value in fields.items() if key == "worker_alive"}
         for key, value in fields.items():
             setattr(job, key, value)
         return job
@@ -125,6 +129,13 @@ def cancel(job_id: str) -> Job | None:
             job.stage = "error"
             job.error = "cancelled"
         return job
+
+
+def mark_worker_done(job_id: str) -> None:
+    with _lock:
+        job = _JOBS.get(job_id)
+        if job is not None:
+            job.worker_alive = False
 
 
 def clear() -> None:

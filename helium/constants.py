@@ -35,3 +35,6 @@ HELIUM_CLS_NAME = "HeliumGPU"
 # deployed: Cls.from_name after `modal deploy` (min_containers=1, always on).
 # ephemeral: app.run() per call (cold start). Env HELIUM_RUNTIME overrides.
 HELIUM_RUNTIME = "deployed"
+# Cold replica boot of four vLLM engines can take many minutes. Demo capture
+# must not sit on diagnose. Env HELIUM_INVOKE_TIMEOUT overrides.
+HELIUM_INVOKE_TIMEOUT_S = 40

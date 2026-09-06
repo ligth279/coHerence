@@ -96,7 +96,15 @@ export async function cancelAudit() {
   }
   try {
     const snap = await cancelJob(jobId);
-    applySnapshot({ ...snap, status: "error", error: snap.error || "cancelled" });
+    if (snap.status === "done") {
+      applySnapshot(snap);
+    } else {
+      applySnapshot({
+        ...snap,
+        status: "error",
+        error: snap.error || "cancelled",
+      });
+    }
   } catch {
     setState({ running: false, status: "error", error: "cancelled" });
   }
